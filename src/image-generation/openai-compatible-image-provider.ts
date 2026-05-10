@@ -150,12 +150,16 @@ export function createOpenAiCompatibleImageGenerationProvider(
     capabilities: options.capabilities,
     async generateImage(req): Promise<ImageGenerationResult> {
       const inputImages = req.inputImages ?? [];
-      const mode: OpenAiCompatibleImageRequestMode = inputImages.length > 0 ? "edit" : "generate";
+      // Cache length to avoid repeated property lookups
+      const inputImageCount = inputImages.length;
+      const mode: OpenAiCompatibleImageRequestMode = inputImageCount > 0 ? "edit" : "generate";
       const maxInputImages = options.capabilities.edit.maxInputImages;
+
+      // Validate eagerly before any async work to fail fast
       if (mode === "edit" && !options.capabilities.edit.enabled) {
         throw new Error(`${options.label} image editing is not supported.`);
       }
-      if (mode === "edit" && maxInputImages !== undefined && inputImages.length > maxInputImages) {
+      if (mode === "edit" && maxInputImages !== undefined && inputImageCount > maxInputImages) {
         throw new Error(
           options.tooManyInputImagesError ??
             `${options.label} image editing supports up to ${maxInputImages} reference image${
@@ -163,7 +167,7 @@ export function createOpenAiCompatibleImageGenerationProvider(
             }.`,
         );
       }
-      if (mode === "edit" && inputImages.length === 0) {
+      if (mode === "edit" && inputImageCount === 0) {
         throw new Error(
           options.missingInputImageError ?? `${options.label} image edit missing reference image.`,
         );
@@ -215,12 +219,21 @@ export function createOpenAiCompatibleImageGenerationProvider(
 
       const model = normalizeModel(req.model, options.defaultModel);
       const count = resolveCount({ req, mode });
-      const requestParams = { req, inputImages, model, count, mode };
+      // mode is already present on requestParams — no spread needed when calling build fns
+      const requestParams: OpenAiCompatibleImageProviderRequestParams = {
+        req,
+        inputImages,
+        model,
+        count,
+        mode,
+      };
       const requestBody =
         mode === "edit"
-          ? options.buildEditRequest({ ...requestParams, mode })
-          : options.buildGenerateRequest({ ...requestParams, mode });
+          ? options.buildEditRequest(requestParams as OpenAiCompatibleImageProviderRequestParams & { mode: "edit" })
+          : options.buildGenerateRequest(requestParams as OpenAiCompatibleImageProviderRequestParams & { mode: "generate" });
       const timeoutMs = resolveRequestTimeoutMs({ options, req, mode });
+
+      // Build per-branch headers directly rather than copying a shared Headers object twice
       const request =
         requestBody.kind === "multipart"
           ? postMultipartRequest({
