@@ -365,6 +365,13 @@ describe("dispatchTelegramMessage draft streaming", () => {
     };
   }
 
+  function createDirectSessionPayload(): TelegramMessageContext["ctxPayload"] {
+    return {
+      SessionKey: "agent:test:telegram:direct:123",
+      ChatType: "direct",
+    } as TelegramMessageContext["ctxPayload"];
+  }
+
   function observeDeliveredReply(text: string): Promise<void> {
     return new Promise((resolve) => {
       deliverReplies.mockImplementation(async (params: { replies?: Array<{ text?: string }> }) => {
@@ -982,6 +989,109 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(answerDraftStream.stop).toHaveBeenCalled();
     expect(deliverReplies).not.toHaveBeenCalled();
     expect(editMessageTelegram).not.toHaveBeenCalled();
+  });
+
+  it("applies partial deltas while preserving the first-preview debounce", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({
+          text: "Streaming ",
+          delta: "Streaming ",
+        });
+        await replyOptions?.onPartialReply?.({
+          text: "Streaming previews ",
+          delta: "previews ",
+        });
+        await replyOptions?.onPartialReply?.({
+          text: "Streaming previews are useful because they show progress.",
+          delta: "are useful because they show progress.",
+        });
+        await dispatcherOptions.deliver(
+          { text: "Streaming previews are useful because they show progress." },
+          { kind: "final" },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(createTelegramDraftStream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        minInitialChars: 30,
+      }),
+    );
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(1, "Streaming ");
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(2, "Streaming previews ");
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(
+      3,
+      "Streaming previews are useful because they show progress.",
+    );
+    expect(answerDraftStream.update).toHaveBeenLastCalledWith(
+      "Streaming previews are useful because they show progress.",
+    );
+    expect(answerDraftStream.stop).toHaveBeenCalled();
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it("replaces non-prefix partial snapshots instead of appending them", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({
+          text: "Working...",
+          delta: "Working...",
+        });
+        await replyOptions?.onPartialReply?.({
+          text: "Done.",
+          delta: "",
+          replace: true,
+        });
+        await dispatcherOptions.deliver({ text: "Done." }, { kind: "final" });
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(1, "Working...");
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(2, "Done.");
+    expect(answerDraftStream.update).toHaveBeenLastCalledWith("Done.");
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it("does not coalesce answer partial fragments with tool progress drafts", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await replyOptions?.onPartialReply?.({ text: "Done ", delta: "Done " });
+        await replyOptions?.onPartialReply?.({ text: "Done answer", delta: "answer" });
+        await dispatcherOptions.deliver({ text: "Done answer." }, { kind: "final" });
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(1, expect.stringMatching(/Exec/));
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(2, "Done ");
+    expect(answerDraftStream.update).toHaveBeenNthCalledWith(3, "Done answer");
+    expect(answerDraftStream.update).toHaveBeenLastCalledWith("Done answer.");
+    expect(deliverReplies).not.toHaveBeenCalled();
   });
 
   it("rotates the answer stream only after a finalized assistant message", async () => {
@@ -1643,5 +1753,42 @@ describe("dispatchTelegramMessage draft streaming", () => {
 
     expect(generateTopicLabel).not.toHaveBeenCalled();
     expect(bot.api.editForumTopic).not.toHaveBeenCalled();
+  });
+
+  it("does not emit a silent-reply fallback when the dispatcher reports a queued final reply", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockResolvedValue({
+      queuedFinal: true,
+      counts: { block: 0, final: 1, tool: 0 },
+    });
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: createDirectSessionPayload(),
+      }),
+      streamMode: "off",
+    });
+
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it("emits a silent-reply fallback when no final reply was queued and nothing was delivered", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockResolvedValue({
+      queuedFinal: false,
+      counts: { block: 0, final: 0, tool: 0 },
+    });
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: createDirectSessionPayload(),
+      }),
+      streamMode: "off",
+    });
+
+    expect(deliverReplies).toHaveBeenCalledTimes(1);
+    const replies = deliverReplies.mock.calls[0]?.[0]?.replies as
+      | Array<{ text?: string }>
+      | undefined;
+    expect(replies?.[0]?.text?.trim()).toBeTruthy();
+    expect(replies?.[0]?.text).not.toBe("NO_REPLY");
   });
 });
