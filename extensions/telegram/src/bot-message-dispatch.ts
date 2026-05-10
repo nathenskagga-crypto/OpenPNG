@@ -57,6 +57,7 @@ import {
   resolveAgentDir,
   resolveDefaultModelForAgent,
 } from "./bot-message-dispatch.agent.runtime.js";
+import { deduplicateBlockSentMedia } from "./bot-message-dispatch.media-dedup.js";
 import { pruneStickerMediaFromContext } from "./bot-message-dispatch.media.js";
 import {
   generateTopicLabel,
@@ -1164,8 +1165,10 @@ export const dispatchTelegramMessage = async ({
             ctxPayload,
             recordInboundSession: context.turn.recordInboundSession,
             record: context.turn.record,
-            runDispatch: () =>
-              telegramDeps.dispatchReplyWithBufferedBlockDispatcher({
+            runDispatch: () => {
+              const sentBlockMediaUrls = new Set<string>();
+
+              return telegramDeps.dispatchReplyWithBufferedBlockDispatcher({
                 ctx: ctxPayload,
                 cfg,
                 dispatcherOptions: {
@@ -1178,6 +1181,16 @@ export const dispatchTelegramMessage = async ({
                     if (payload.isError === true) {
                       hadErrorReplyFailureOrSkip = true;
                     }
+
+                    const deduped =
+                      info.kind === "final"
+                        ? deduplicateBlockSentMedia(payload, sentBlockMediaUrls)
+                        : payload;
+                    if (deduped === undefined) {
+                      return;
+                    }
+                    const effectivePayload = deduped;
+
                     if (info.kind === "final") {
                       await enqueueDraftLaneEvent(async () => {});
                     }
@@ -1192,16 +1205,16 @@ export const dispatchTelegramMessage = async ({
                       return;
                     }
                     const telegramButtons = (
-                      payload.channelData?.telegram as
+                      effectivePayload.channelData?.telegram as
                         | { buttons?: TelegramInlineButtons }
                         | undefined
                     )?.buttons;
                     const split = splitTextIntoLaneSegments(
-                      { text: payload.text },
+                      { text: effectivePayload.text },
                       payload.isReasoning,
                     );
                     const segments = split.segments;
-                    const reply = resolveSendableOutboundReplyParts(payload);
+                    const reply = resolveSendableOutboundReplyParts(effectivePayload);
                     const _hasMedia = reply.hasMedia;
 
                     const flushBufferedFinalAnswer = async () => {
@@ -1225,6 +1238,7 @@ export const dispatchTelegramMessage = async ({
                       reasoningStepState.resetForNextStep();
                     };
 
+                    let blockDelivered = false;
                     for (const segment of segments) {
                       if (
                         segment.lane === "answer" &&
@@ -1232,7 +1246,7 @@ export const dispatchTelegramMessage = async ({
                         reasoningStepState.shouldBufferFinalAnswer()
                       ) {
                         reasoningStepState.bufferFinalAnswer({
-                          payload,
+                          payload: effectivePayload,
                           text: segment.update.text,
                           bufferedGeneration: replyFenceGeneration,
                         });
@@ -1245,17 +1259,21 @@ export const dispatchTelegramMessage = async ({
                         streamMode === "progress" &&
                         segment.lane === "answer" &&
                         info.kind === "final"
-                          ? await deliverProgressModeFinalAnswer(payload, segment.update.text)
+                          ? await deliverProgressModeFinalAnswer(
+                              effectivePayload,
+                              segment.update.text,
+                            )
                           : await deliverLaneText({
                               laneName: segment.lane,
                               text: segment.update.text,
-                              payload,
+                              payload: effectivePayload,
                               infoKind: info.kind,
                               buttons: telegramButtons,
                             });
                       if (info.kind === "final") {
                         emitPreviewFinalizedHook(result);
                       }
+                      blockDelivered = blockDelivered || result.kind !== "skipped";
                       if (segment.lane === "reasoning") {
                         if (result.kind !== "skipped") {
                           reasoningStepState.noteReasoningDelivered();
@@ -1267,20 +1285,33 @@ export const dispatchTelegramMessage = async ({
                         reasoningStepState.resetForNextStep();
                       }
                     }
+                    const trackBlockMedia = (delivered: boolean) => {
+                      if (delivered && info.kind === "block" && payload.mediaUrls?.length) {
+                        for (const url of payload.mediaUrls) {
+                          sentBlockMediaUrls.add(url);
+                        }
+                      }
+                    };
+
                     if (segments.length > 0) {
+                      trackBlockMedia(blockDelivered);
                       return;
                     }
                     if (split.suppressedReasoningOnly) {
+                      let delivered = false;
                       if (reply.hasMedia) {
                         const payloadWithoutSuppressedReasoning =
-                          typeof payload.text === "string" ? { ...payload, text: "" } : payload;
-                        await sendPayload(payloadWithoutSuppressedReasoning, {
+                          typeof effectivePayload.text === "string"
+                            ? { ...effectivePayload, text: "" }
+                            : effectivePayload;
+                        delivered = await sendPayload(payloadWithoutSuppressedReasoning, {
                           durable: info.kind === "final",
                         });
                       }
                       if (info.kind === "final") {
                         await flushBufferedFinalAnswer();
                       }
+                      trackBlockMedia(delivered);
                       return;
                     }
 
@@ -1296,10 +1327,13 @@ export const dispatchTelegramMessage = async ({
                       }
                       return;
                     }
-                    await sendPayload(payload, { durable: info.kind === "final" });
+                    const delivered = await sendPayload(effectivePayload, {
+                      durable: info.kind === "final",
+                    });
                     if (info.kind === "final") {
                       await flushBufferedFinalAnswer();
                     }
+                    trackBlockMedia(delivered);
                   },
                   onSkip: (payload, info) => {
                     if (payload.isError === true) {
@@ -1488,7 +1522,8 @@ export const dispatchTelegramMessage = async ({
                     : undefined,
                   onModelSelected,
                 },
-              }),
+              });
+            },
           }),
         },
       });
