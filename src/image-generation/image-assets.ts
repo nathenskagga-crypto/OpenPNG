@@ -81,10 +81,13 @@ export function toImageDataUrl(params: {
   return `data:${mimeType};base64,${params.buffer.toString("base64")}`;
 }
 
+// Compiled once at module load — avoids regex recompilation on every call
+const DATA_URL_RE = /^data:(image\/[^;,]+)(?:;[^,]*)?;base64,(.+)$/is;
+
 export function parseImageDataUrl(
   dataUrl: string,
 ): { mimeType: string; base64: string } | undefined {
-  const match = dataUrl.match(/^data:(image\/[^;,]+)(?:;[^,]*)?;base64,(.+)$/is);
+  const match = dataUrl.match(DATA_URL_RE);
   if (!match) {
     return undefined;
   }
@@ -110,6 +113,7 @@ export function generatedImageAssetFromBase64(params: {
     return undefined;
   }
   const buffer = Buffer.from(base64, "base64");
+  // Normalize once and reuse rather than calling normalizeOptionalString twice on same fields
   const explicitMimeType = normalizeOptionalString(params.mimeType);
   const defaultMimeType =
     normalizeOptionalString(params.defaultMimeType) ?? DEFAULT_IMAGE_MIME_TYPE;
@@ -122,6 +126,7 @@ export function generatedImageAssetFromBase64(params: {
   const image: GeneratedImageAsset = {
     buffer,
     mimeType,
+    // Reuse detected.extension when available to skip a second imageFileExtensionForMimeType call
     fileName: `${prefix}-${params.index + 1}.${detected?.extension ?? imageFileExtensionForMimeType(mimeType)}`,
   };
   const revisedPrompt = normalizeOptionalString(params.revisedPrompt);
